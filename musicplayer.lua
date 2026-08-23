@@ -1,22 +1,14 @@
 local dfpwm = require("cc.audio.dfpwm")
 
 local speaker = peripheral.find("speaker")
-
 if not speaker then
-    error("No speaker peripheral found!")
+    error("No speaker found")
 end
 
 local SONG_DIR = "songs"
 local CHUNK_SIZE = 16 * 1024
 
--- =========================================
 -- Find songs
--- =========================================
-
-if not fs.exists(SONG_DIR) then
-    fs.makeDir(SONG_DIR)
-end
-
 local songs = {}
 
 for _, file in ipairs(fs.list(SONG_DIR)) do
@@ -28,256 +20,180 @@ end
 table.sort(songs)
 
 if #songs == 0 then
-    error("No .dfpwm files found in /songs")
+    error("No .dfpwm files in /songs")
 end
 
--- =========================================
 -- State
--- =========================================
-
-local currentSong = 1
+local song = 1
 local playing = false
-local stopRequested = false
-local nextRequested = false
-local exiting = false
+local quit = false
 
--- =========================================
--- UI
--- =========================================
-
-local width, height = term.getSize()
-
-local function clear()
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
-    term.clear()
-end
-
-local function center(y, text, color)
-    term.setTextColor(color or colors.white)
-
-    local x = math.floor((width - #text) / 2) + 1
-
-    term.setCursorPos(x, y)
-    term.write(text)
-end
-
-local function button(x, y, w, h, text, bg, fg)
-    term.setBackgroundColor(bg)
-    term.setTextColor(fg or colors.white)
-
-    for i = 0, h - 1 do
-        term.setCursorPos(x, y + i)
-        term.write(string.rep(" ", w))
-    end
-
-    local tx = x + math.floor((w - #text) / 2)
-    local ty = y + math.floor(h / 2)
-
-    term.setCursorPos(tx, ty)
-    term.write(text)
-
-    term.setBackgroundColor(colors.black)
-end
+-- Screen
+local w, h = term.getSize()
 
 local function draw()
-    clear()
+    term.setBackgroundColor(colors.black)
+    term.clear()
 
-    center(2, "DFPWM MUSIC PLAYER", colors.cyan)
+    term.setTextColor(colors.cyan)
+    term.setCursorPos(2, 2)
+    term.write("DFPWM MUSIC PLAYER")
 
-    center(
-        5,
-        songs[currentSong],
-        colors.white
-    )
+    term.setTextColor(colors.white)
+    term.setCursorPos(2, 5)
+    term.write("Song: " .. songs[song])
 
-    if playing then
-        center(6, "PLAYING", colors.lime)
-    else
-        center(6, "STOPPED", colors.gray)
-    end
+    term.setTextColor(playing and colors.lime or colors.gray)
+    term.setCursorPos(2, 6)
+    term.write(playing and "PLAYING" or "STOPPED")
 
     -- Play / Stop
-    button(
-        2, 9, 12, 3,
-        playing and "STOP" or "PLAY",
-        playing and colors.red or colors.green
-    )
+    term.setBackgroundColor(playing and colors.red or colors.green)
+    term.setTextColor(colors.white)
+
+    term.setCursorPos(2, 9)
+    term.write("            ")
+
+    term.setCursorPos(5, 10)
+    term.write(playing and "STOP" or "PLAY")
 
     -- Next
-    button(
-        16, 9, 12, 3,
-        "NEXT",
-        colors.blue
-    )
+    term.setBackgroundColor(colors.blue)
 
-    -- Exit
-    button(
-        width - 5, 1, 4, 2,
-        "X",
-        colors.red
-    )
+    term.setCursorPos(16, 9)
+    term.write("            ")
+
+    term.setCursorPos(20, 10)
+    term.write("NEXT")
+
+    -- X
+    term.setBackgroundColor(colors.red)
+
+    term.setCursorPos(w - 5, 1)
+    term.write("    ")
+
+    term.setCursorPos(w - 4, 1)
+    term.write(" X ")
 
     term.setBackgroundColor(colors.black)
 end
 
--- =========================================
--- Advance song
--- =========================================
-
-local function nextSong()
-    currentSong = currentSong + 1
-
-    if currentSong > #songs then
-        currentSong = 1
-    end
-
-    draw()
+local function inside(x, y, x1, y1, x2, y2)
+    return x >= x1 and x <= x2 and y >= y1 and y <= y2
 end
 
--- =========================================
--- Playback thread
--- =========================================
+draw()
 
-local function playback()
-    while not exiting do
+-- Playback coroutine
+local player = coroutine.create(function()
 
-        -- Wait until Play is pressed
-        while not playing and not exiting do
-            os.pullEvent("play_song")
+    while true do
+
+        -- Wait until we're told to play
+        while not playing do
+            coroutine.yield()
         end
 
-        if exiting then
-            break
-        end
-
-        local path = fs.combine(
-            SONG_DIR,
-            songs[currentSong]
+        local file = fs.open(
+            fs.combine(SONG_DIR, songs[song]),
+            "rb"
         )
-
-        local file = fs.open(path, "rb")
 
         if not file then
             playing = false
             draw()
-            sleep(1)
-        else
-            local decoder = dfpwm.make_decoder()
+            coroutine.yield()
+        end
 
-            stopRequested = false
-            nextRequested = false
+        local decoder = dfpwm.make_decoder()
 
-            while playing and not stopRequested do
+        while playing do
 
-                local chunk = file.read(CHUNK_SIZE)
+            local data = file.read(CHUNK_SIZE)
 
-                if not chunk then
+            if not data then
+                break
+            end
+
+            local audio = decoder(data)
+
+            while not speaker.playAudio(audio) do
+                if not playing then
                     break
                 end
 
-                local audio = decoder(chunk)
-
-                while not speaker.playAudio(audio) do
-                    if not playing or stopRequested then
-                        break
-                    end
-
-                    os.pullEvent("speaker_audio_empty")
-                end
+                -- Let the main event loop handle mouse events
+                coroutine.yield()
             end
 
-            file.close()
-            speaker.stop()
+            coroutine.yield()
+        end
 
-            -- Was the song skipped?
-            if nextRequested then
-                nextRequested = false
-                stopRequested = false
-                playing = true
+        file.close()
+        speaker.stop()
 
-                nextSong()
+        if playing then
+            -- Song finished
+            song = song + 1
 
-            -- Was the song stopped?
-            elseif stopRequested then
-                stopRequested = false
-                playing = false
-                draw()
-
-            -- Song naturally ended
-            else
-                playing = false
-                nextSong()
+            if song > #songs then
+                song = 1
             end
         end
+
+        playing = false
+        draw()
+    end
+end)
+
+-- Main event loop
+while not quit do
+
+    -- Give playback some CPU time
+    if coroutine.status(player) ~= "dead" then
+        coroutine.resume(player)
     end
 
-    speaker.stop()
-end
+    -- Wait for ONE event
+    local event, button, x, y = os.pullEvent()
 
--- =========================================
--- Mouse thread
--- =========================================
-
-local function mouse()
-    while not exiting do
-        local event, buttonPressed, x, y = os.pullEvent("mouse_click")
+    if event == "mouse_click" then
 
         -- PLAY / STOP
-        if x >= 2 and x < 14 and y >= 9 and y < 12 then
+        if inside(x, y, 2, 9, 13, 11) then
 
             if playing then
                 playing = false
-                stopRequested = true
                 speaker.stop()
-                draw()
             else
                 playing = true
-                draw()
-                os.queueEvent("play_song")
             end
+
+            draw()
 
         -- NEXT
-        elseif x >= 16 and x < 28 and y >= 9 and y < 12 then
+        elseif inside(x, y, 16, 9, 27, 11) then
 
-            if playing then
-                nextRequested = true
-                stopRequested = true
-                speaker.stop()
-            else
-                nextSong()
-            end
-
-        -- X
-        elseif x >= width - 5 and x < width - 1 and y >= 1 and y < 3 then
-
-            exiting = true
             playing = false
-            stopRequested = true
             speaker.stop()
 
-            term.setBackgroundColor(colors.black)
-            term.setTextColor(colors.white)
-            term.clear()
-            term.setCursorPos(1, 1)
+            song = song + 1
 
-            os.queueEvent("exit_player")
+            if song > #songs then
+                song = 1
+            end
+
+            draw()
+
+        -- X
+        elseif inside(x, y, w - 5, 1, w - 2, 2) then
+
+            quit = true
+            playing = false
+            speaker.stop()
         end
     end
 end
-
--- =========================================
--- Start
--- =========================================
-
-draw()
-
-parallel.waitForAny(
-    playback,
-    mouse
-)
-
-speaker.stop()
 
 term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
